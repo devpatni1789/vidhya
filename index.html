@@ -1,21 +1,59 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#d9f3f6">
-<title>GTU Diploma · Study Space</title>
-  <link rel="stylesheet" href="assets/css/styles.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GTU PREP — Semester 3 Exam Preparation</title>
+  <meta name="description" content="Track every question from your Semester 3 question banks and GTU papers — CN, DEF, DS, FOS and RDBMS." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d1d2b'/%3E%3Cpath d='M9 21V11h9M9 16h7' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='22.5' cy='21' r='2.5' fill='%235b7cfa'/%3E%3C/svg%3E" />
 </head>
 <body>
-<div id="app"></div>
-  <script src="assets/js/config.js" defer></script>
-  <!-- Firebase Authentication SDKs. Configure assets/js/config.js before enabling auth. -->
-  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js" defer></script>
-  <script src="https://www.gstatic.com/firebase-auth-compat.js" defer></script>
-  <script src="https://www.gstatic.com/firebase-firestore-compat.js" defer></script>
-  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-storage-compat.js" defer></script>
-  <script src="assets/data/curriculum.js" defer></script>
-  <script src="assets/js/app.js" defer></script>
+  <div id="app">
+    <main id="view" class="view"></main>
+  </div>
+
+  <nav class="dock" id="dock" aria-label="Primary">
+    <span class="dock-indicator" id="dockIndicator" aria-hidden="true"></span>
+    <a class="dock-item" href="#/dashboard" data-route="dashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.8"/></svg>
+      <span class="dock-label">Dashboard</span>
+    </a>
+    <a class="dock-item" href="#/subjects" data-route="subjects">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.2V6.8a2 2 0 0 1 1.6-2l4.7-.94a1 1 0 0 1 1.2 1v14.3a1 1 0 0 1-1.2 1l-4.7-1a2 2 0 0 1-1.6-2Z"/><path d="M20 19.2V6.8a2 2 0 0 0-1.6-2l-4.7-.94a1 1 0 0 0-1.2 1v14.3a1 1 0 0 0 1.2 1l4.7-1a2 2 0 0 0 1.6-2Z"/></svg>
+      <span class="dock-label">Subjects</span>
+    </a>
+    <a class="dock-item" href="#/study" data-route="study">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.4-3.4"/></svg>
+      <span class="dock-label">Study</span>
+    </a>
+    <a class="dock-item" href="#/revision" data-route="revision">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 1 2.5 6"/><path d="M3.5 21v-5h5"/><path d="M12 8.5v4l2.5 1.5"/></svg>
+      <span class="dock-label">Revision</span>
+    </a>
+    <a class="dock-item" href="#/settings" data-route="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .32 1.77l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.6 1.6 0 0 0-1.77-.32 1.6 1.6 0 0 0-1 1.47V21a2 2 0 1 1-4 0v-.09a1.6 1.6 0 0 0-1-1.47 1.6 1.6 0 0 0-1.77.32l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.6 1.6 0 0 0 .32-1.77 1.6 1.6 0 0 0-1.47-1H3a2 2 0 1 1 0-4h.09a1.6 1.6 0 0 0 1.47-1 1.6 1.6 0 0 0-.32-1.77l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.6 1.6 0 0 0 1.77.32h.08a1.6 1.6 0 0 0 1-1.47V3a2 2 0 1 1 4 0v.09a1.6 1.6 0 0 0 1 1.47h.08a1.6 1.6 0 0 0 1.77-.32l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.6 1.6 0 0 0-.32 1.77v.08a1.6 1.6 0 0 0 1.47 1H21a2 2 0 1 1 0 4h-.09a1.6 1.6 0 0 0-1.47 1Z"/></svg>
+      <span class="dock-label">Settings</span>
+    </a>
+  </nav>
+
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <h3 id="modalTitle"></h3>
+      <p id="modalBody"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="modalCancel">Cancel</button>
+        <button class="btn btn-danger" id="modalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="data.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

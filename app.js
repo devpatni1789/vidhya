@@ -1,147 +1,682 @@
-(function(){'use strict';
-const GOOGLE_CLIENT_ID=(window.GTU_CONFIG&&window.GTU_CONFIG.googleClientId)||'';
-const FIREBASE_CONFIG=(window.GTU_CONFIG&&window.GTU_CONFIG.firebase)||{};
-let firebaseAuthInstance=null;
-let firestoreDb=null;
-let firebaseStorage=null;
-let publicShareLoading=false;
-let firebaseUser=null;
-let cloudReady=false;
-let cloudSyncTimer=null;
-function firebaseConfigPresent(){return !!(FIREBASE_CONFIG.apiKey&&FIREBASE_CONFIG.authDomain&&FIREBASE_CONFIG.projectId&&FIREBASE_CONFIG.appId)}
-function firebaseBlockedByFile(){return firebaseConfigPresent()&&window.location.protocol==='file:'}
-function firebaseConfigured(){return firebaseConfigPresent()&&window.location.protocol!=='file:'&&!!window.firebase}
-function ensureFirebaseAuth(){if(!firebaseConfigured())return null;try{if(!firebaseAuthInstance){if(!window.firebase.apps.length)window.firebase.initializeApp(FIREBASE_CONFIG);firebaseAuthInstance=window.firebase.auth()}return firebaseAuthInstance}catch(error){console.error('Firebase initialization failed',error);return null}}
-function ensureFirestore(){if(!firebaseConfigured()||!window.firebase.firestore)return null;try{if(!firestoreDb)firestoreDb=window.firebase.firestore();return firestoreDb}catch(error){console.error('Firestore initialization failed',error);return null}}
-function ensureStorage(){if(!firebaseConfigured()||!window.firebase.storage)return null;try{if(!firebaseStorage)firebaseStorage=window.firebase.storage();return firebaseStorage}catch(error){console.error('Storage initialization failed',error);return null}}
-function cloudShareReady(){return !!(firebaseUser&&ensureFirestore()&&ensureStorage())}
-function publicToken(){const m=location.hash.match(/^#shared=([^&]+)/);return m?decodeURIComponent(m[1]):null}
-async function uploadCloudFile(file,item){if(!cloudShareReady())return;try{const ref=ensureStorage().ref('shared-files/'+firebaseUser.uid+'/'+item.id+'-'+file.name);await ref.put(file);item.storagePath=ref.fullPath;item.downloadUrl=await ref.getDownloadURL();item.cloudReady=true;saveAll()}catch(error){console.error('Cloud file upload failed',error);toast('Cloud upload failed. Check Firebase Storage rules.',true)}}
-function sharePayload(type,obj){const scope=obj.scope;const folders=state.folders.filter(f=>f.scope===scope);const rootId=type==='folder'?obj.id:null;const folderIds=rootId?[rootId]:[];let changed=true;while(changed){changed=false;folders.forEach(f=>{if(folderIds.includes(f.parentId)&&!folderIds.includes(f.id)){folderIds.push(f.id);changed=true}})}const files=state.files.filter(f=>f.scope===scope&&(type==='file'?f.id===obj.id:folderIds.includes(f.parentId||null))).map(f=>({id:f.id,name:f.name,sizeText:f.sizeText,downloadUrl:f.downloadUrl||null,storagePath:f.storagePath||null,mime:f.mime||'application/octet-stream'}));return {type,scope,name:obj.name,createdAt:new Date().toISOString(),root:{id:obj.id,name:obj.name},folders:folders.filter(f=>folderIds.includes(f.id)).map(f=>({id:f.id,name:f.name,parentId:f.parentId||null})),files}}
-async function publishCloudShare(record,obj){if(!cloudShareReady()){toast('To share across devices, configure Firebase and sign in first.',true);return false}if(obj.type==='file'&&!obj.downloadUrl){toast('Upload the file to cloud before sharing it.',true);return false}const payload=sharePayload(record.type,obj);if(payload.files.some(f=>!f.downloadUrl)){toast('Some files are not uploaded to cloud yet. Re-upload them after Firebase setup.',true);return false}try{await ensureFirestore().collection('publicShares').doc(record.token).set(payload);record.cloud=true;saveAll();return true}catch(error){console.error('Public share publish failed',error);toast('Could not publish public link. Check Firestore rules.',true);return false}}
-async function loadPublicShare(token){if(!firebaseConfigured()||!ensureFirestore())return null;try{const snap=await ensureFirestore().collection('publicShares').doc(token).get();return snap.exists?snap.data():null}catch(error){console.error('Public share load failed',error);return null}}
-function publicShareMarkup(data){const files=data.files||[],folders=data.folders||[];let body='';if(data.type==='file'){body=files.map(f=>'<article><span>'+icon('file')+'</span><div><strong>'+esc(f.name)+'</strong><small>'+esc(f.sizeText||'File')+'</small></div><a class="soft-btn" href="'+esc(f.downloadUrl||'#')+'" target="_blank" rel="noopener">'+icon('eye')+' View</a><a class="soft-btn" href="'+esc(f.downloadUrl||'#')+'" download>'+icon('download')+' Download</a></article>').join('')}else{const allFolders=folders.concat([{id:'root',name:data.name,parentId:null}]);body=allFolders.map(f=>{const folderId=f.id==='root'?(data.root&&data.root.id):f.id;const childFiles=files.filter(x=>x.parentId===folderId);return '<div class="public-folder"><strong>'+icon('folder')+' '+esc(f.name)+'</strong>'+(childFiles.map(x=>'<a href="'+esc(x.downloadUrl||'#')+'" target="_blank" rel="noopener">'+icon('file')+' '+esc(x.name)+' <small>'+esc(x.sizeText||'')+'</small></a>').join('')||'<small>No files</small>')+'</div>'}).join('')}return '<main class="public-share"><div class="public-share-card"><p class="eyebrow">GTU Study Space · Public Share</p><h1>'+esc(data.name||'Shared resource')+'</h1><p class="public-share-sub">Open and download the original shared resource. No account is required.</p><div class="public-share-list">'+body+'</div><a class="public-back" href="'+esc(location.href.split('#')[0])+'">Open GTU Study Space</a></div></main>'}
-async function renderPublicSharePage(token){publicShareLoading=true;document.getElementById('app').innerHTML='<main class="public-share"><div class="public-share-card"><p class="eyebrow">Loading shared resource…</p><h1>Preparing your file</h1></div></main>';const data=await loadPublicShare(token);publicShareLoading=false;document.getElementById('app').innerHTML=data?publicShareMarkup(data):'<main class="public-share"><div class="public-share-card"><p class="eyebrow">Share link unavailable</p><h1>This link is invalid or expired.</h1><p class="public-share-sub">Ask the owner to create a new public share link.</p></div></main>'}
-function cloudStateDoc(){const db=ensureFirestore();return db&&firebaseUser?db.collection('users').doc(firebaseUser.uid).collection('app').doc('state'):null}
-function cloudSyncAvailable(){return !!(cloudReady&&firebaseUser&&cloudStateDoc())}
-function scheduleCloudSync(){if(!cloudSyncAvailable())return;clearTimeout(cloudSyncTimer);cloudSyncTimer=setTimeout(pushCloudState,350)}
-async function pushCloudState(){const doc=cloudStateDoc();if(!doc)return;try{await doc.set({progress:state.progress,semester:state.semester,profile:state.profile,updatedAt:window.firebase.firestore.FieldValue.serverTimestamp()},{merge:true});toast('Progress synced to your account.')}catch(error){console.error('Firestore sync failed',error);toast('Cloud sync failed. Check Firestore setup.',true)}}
-async function loadCloudState(){const doc=cloudStateDoc();if(!doc){cloudReady=true;return}try{const snapshot=await doc.get();if(snapshot.exists){const cloud=snapshot.data()||{};if(cloud.progress&&typeof cloud.progress==='object')state.progress={...state.progress,...cloud.progress};if(Number(cloud.semester))state.semester=Number(cloud.semester);if(cloud.profile&&typeof cloud.profile==='object')state.profile={...state.profile,...cloud.profile};saveAll()}cloudReady=true;scheduleCloudSync()}catch(error){console.error('Firestore load failed',error);cloudReady=true;toast('Could not load cloud progress; using local copy.',true)}}
-const KEY={account:'gtu_hub_account_v1',session:'gtu_hub_session_v1',profile:'gtu_hub_profile_v1',progress:'gtu_hub_progress_v1',notes:'gtu_hub_notes_v1',tasks:'gtu_hub_tasks_v1',files:'gtu_hub_files_v1',timetable:'gtu_hub_timetable_v1',settings:'gtu_hub_settings_v1',folders:'gtu_hub_folders_v1',shares:'gtu_hub_shares_v1',folders:'gtu_hub_folders_v1',shares:'gtu_hub_shares_v1'};
-	const curriculum=window.GTU_CURRICULUM||[];
-const icons={
- dashboard:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
- book:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21V5.5Z"/><path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20M8 7h8M8 10h6"/></svg>',
- note:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>',
- task:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h4"/><path d="m6.8 8 .8.8L9 7.4"/></svg>',
- file:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></svg>',
- badge:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m12 3 2.3 2.1 3.1-.2.9 3 2.5 1.8-1.5 2.7.5 3.1-3 .9-1.4 2.8-2.9-1-2.9 1-1.4-2.8-3-.9.5-3.1L4.2 9.7l2.5-1.8.9-3 3.1.2L12 3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>',
- calendar:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M8 14h3M8 17h5"/></svg>',
- settings:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 15.3a3.3 3.3 0 1 0 0-6.6 3.3 3.3 0 0 0 0 6.6Z"/><path d="m19.4 15 .1.1a2 2 0 0 1-2.8 2.8l-.1-.1a2 2 0 0 0-3.4 1.4v.2a2 2 0 0 1-4 0v-.2a2 2 0 0 0-3.4-1.4l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1A2 2 0 0 0 3.6 12a2 2 0 0 0-.1-.6l-.1-.1a2 2 0 0 1 2.8-2.8l.1.1A2 2 0 0 0 9.7 7.2V7a2 2 0 0 1 4 0v.2a2 2 0 0 0 3.4 1.4l.1-.1A2 2 0 0 1 20 11.3l-.1.1A2 2 0 0 0 19.4 15Z"/></svg>',
- user:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.7-3.3 3.1-5 7-5s6.3 1.7 7 5"/></svg>',
- search:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 5 5"/></svg>',
- moon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 15.4A8 8 0 0 1 8.6 4 8 8 0 1 0 20 15.4Z"/></svg>',
- sun:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
- plus:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg>',
- arrow:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 12h13M13 6l6 6-6 6"/></svg>',
- check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m5 12 4 4L19 6"/></svg>',
- upload:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M7 9l5-5 5 5M5 14v5h14v-5"/></svg>',
- download:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg>',
- chevron:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 9 6 6 6-6"/></svg>',
- x:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 6 12 12M18 6 6 18"/></svg>',
- eye:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2.5 12s3.2-6 9.5-6 9.5 6 9.5 6-3.2 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>',
- more:'<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>',folder:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>',share:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.5-4.5M8.2 13.2l7.5 4.5"/></svg>',link:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1"/></svg>',move:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h10M4 17h7"/></svg>',more:'<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>',folder:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>',share:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.5-4.5M8.2 13.2l7.5 4.5"/></svg>',link:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1"/></svg>',move:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h10M4 17h7"/></svg>',lock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>',
-};
-function icon(name){return icons[name]||icons.file}
-function esc(value){return String(value??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
-function get(key,fallback){try{const v=localStorage.getItem(key);return v?JSON.parse(v):fallback}catch(_){return fallback}}
-function set(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch(_){} }
-function id(){return Date.now().toString(36)+Math.random().toString(36).slice(2,8)}
-function initials(name){return (name||'G').trim().charAt(0).toUpperCase()}
-function currentSession(){return get(KEY.session,null)}
-function hasAccount(){return !!get(KEY.account,null)}
-function account(){return get(KEY.account,null)}
-function activeProfile(){return get(KEY.profile,{name:'GTU Student',email:'',semester:3,branch:'Computer Engineering',college:'GTU Diploma'})}
-let state={view:'dashboard',semester:3,theme:'dark',profile:activeProfile(),progress:get(KEY.progress,{}),notes:get(KEY.notes,[]),tasks:get(KEY.tasks,[]),files:get(KEY.files,[]),folders:get(KEY.folders,[]),shares:get(KEY.shares,[]),timetable:get(KEY.timetable,[]),openSubject:null,query:'',mobileMenu:false,profileMenu:false,registerMode:'email',activeFolderId:null};
-let toastTimer;
-function toast(message,error){const old=document.querySelector('.toast');if(old)old.remove();const el=document.createElement('div');el.className='toast'+(error?' error':'');el.textContent=message;document.body.appendChild(el);toastTimer&&clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.remove(),3200)}
-function saveAll(){set(KEY.profile,state.profile);set(KEY.progress,state.progress);set(KEY.notes,state.notes);set(KEY.tasks,state.tasks);set(KEY.files,state.files);set(KEY.folders,state.folders);set(KEY.shares,state.shares);set(KEY.timetable,state.timetable);set(KEY.settings,{theme:state.theme});scheduleCloudSync()}
-function subjects(){return curriculum.filter(s=>s.semester===state.semester)}
-function unitWeight(s,i){return Number(s.weights&&s.weights[i])||Math.round(100/s.units.length)}
-function subjectProgress(s){if(!s.units.length)return 0;return Math.round(s.units.reduce((n,_,i)=>n+(state.progress[state.semester+'::'+s.code+'::'+i]?unitWeight(s,i):0),0))}
-function overall(){const ss=subjects().filter(s=>s.units.length);const total=ss.length*100;const done=ss.reduce((n,s)=>n+subjectProgress(s),0);return total?Math.round(done/total*100):0}
-function setView(view){state.view=view;state.query='';state.profileMenu=false;state.mobileMenu=false;window.scrollTo({top:0,behavior:'smooth'});renderApp()}
-function showTransition(message,callback){const el=document.createElement('div');el.className='transition';el.innerHTML='<div class="transition-inner"><div class="transition-mark">'+icon('book')+'</div><h2>'+esc(message)+'</h2><p>Opening your GTU study space</p><div class="line"><i></i></div></div>';document.body.appendChild(el);setTimeout(()=>{el.remove();callback()},850)}
-function authScreen(mode){
- const remote=firebaseConfigPresent();
- const fileBlocked=firebaseBlockedByFile();
- const existing=hasAccount()||remote;
- if(mode==='recovery')return `<main class="screen auth-screen"><div class="ambient-grid"></div><div class="orb one"></div><div class="orb two"></div><div class="auth-layout"><section class="auth-copy"><div class="auth-brand"><span class="brand-symbol"></span><span class="brand-lockup"><b>GTU DIPLOMA</b><small>STUDY SPACE</small></span></div><h1>Reset your <em>local</em> access.</h1><p>This recovery flow clears the account saved in this browser so you can create a new local profile. It does not send email or contact an external service.</p><div class="code-window"><div class="window-bar"><i></i><i></i><i></i></div><div class="code-line"><span>01</span><b>storage</b>.<strong>reset</strong>(<em>"local-account"</em>)</div><div class="code-line"><span>02</span><b>profile</b>.<strong>initialize</strong>(<em>"your-semester"</em>)</div></div></section><section class="auth-card"><header><p class="eyebrow">Local account recovery</p><h2>Start fresh, safely.</h2><p>Only this browser’s local account will be removed.</p></header><p class="recovery-copy">Your saved study content can be preserved unless you choose a full reset. To change the sign-in identity, reset the local browser account and create a new profile.</p><button class="primary-btn" id="reset-account">Reset local account</button><div class="auth-hint" id="auth-message"></div><div class="mini-action"><button id="back-login">Back to login</button></div><div class="auth-footer">${remote?'Authentication uses Firebase for account security.':'Authentication is local/browser-based and does not provide server-side security.'}</div></section></div></main>`;
- const registration=mode==='register';
- const usernameOnly=remote?false:state.registerMode==='username';
- const nameField=registration?`<div class="field"><label for="auth-name">Name</label><div class="field-wrap"><input id="auth-name" name="name" autocomplete="name" placeholder="Your name" required></div></div>`:'';
- const emailMode=registration&&!usernameOnly;
- const identityLabel=registration?(emailMode?'Email':'Username'):'Username or email';
- const identityType=registration&&emailMode?'email':'text';
- const identityAutocomplete=registration&&emailMode?'email':'username';
- const identityPlaceholder=registration&&emailMode?'you@example.com':(registration?'e.g. aarav123':'username or email');
- const identityField=`<div class="field"><label for="auth-identity">${identityLabel}</label><div class="field-wrap has-icon"><input id="auth-identity" name="identity" type="${identityType}" autocomplete="${identityAutocomplete}" placeholder="${identityPlaceholder}" required><span class="field-icon" id="identity-valid">${icon('check')}</span></div></div>`;
- const emailField=registration&&!remote&&usernameOnly?`<div class="field"><label for="auth-email">Email (optional)</label><div class="field-wrap has-icon"><input id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com"><span class="field-icon">${icon('check')}</span></div></div>`:'';
- const passwordField=`<div class="field"><label for="auth-password">Password</label><div class="field-wrap has-icon"><input id="auth-password" name="password" type="password" autocomplete="${registration?'new-password':'current-password'}" placeholder="At least 6 characters" required><span class="field-icon" id="toggle-password" title="Show password">${icon('eye')}</span></div></div>`;
- const confirmField=registration?`<div class="field"><label for="auth-confirm">Confirm password</label><div class="field-wrap has-icon"><input id="auth-confirm" name="confirm" type="password" autocomplete="new-password" placeholder="Repeat password" required><span class="field-icon" id="confirm-valid">${icon('check')}</span></div></div>`:'';
- const semesterFields=registration?`<div class="field-grid"><div class="field"><label for="auth-semester">Semester</label><select id="auth-semester" name="semester">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===3?'selected':''}>Semester ${n}</option>`).join('')}</select></div><div class="field"><label for="auth-branch">Branch</label><input id="auth-branch" name="branch" value="Computer Engineering" autocomplete="organization-title"></div></div>`:'';
- const formFields=registration?`${nameField}${identityField}${emailField}${passwordField}${confirmField}${semesterFields}`:`${identityField}${passwordField}<div class="check-row"><label class="check-label"><input id="remember" type="checkbox" checked> Remember me</label><button type="button" class="text-link" id="forgot">Forgot password?</button></div>`;
- return `<main class="screen auth-screen"><div class="ambient-grid"></div><div class="orb one"></div><div class="orb two"></div><div class="auth-layout"><section class="auth-copy"><div class="auth-brand"><span class="brand-symbol"></span><span class="brand-lockup"><b>GTU DIPLOMA</b><small>STUDY SPACE</small></span></div><h1>Keep your semester in <em>focus.</em></h1><p>A calm, cinematic workspace for GTU syllabus progress, notes, tasks, study files, and the next academic action.</p><div class="code-window"><div class="window-bar"><i></i><i></i><i></i></div><div class="code-line"><span>01</span><b>workspace</b>.<strong>open</strong>(<em>"semester-${state.semester}"</em>)</div><div class="code-line"><span>02</span><b>progress</b>.<strong>move</strong>(<em>"one unit at a time"</em>)</div><div class="code-line"><span>03</span><b>focus</b>.<strong>preserved</strong> = <em>true</em></div></div></section><section class="auth-card"><div class="auth-tabs"><button class="${!registration?'active':''}" data-auth="login">Login</button><button class="${registration?'active':''}" data-auth="register">Create account</button></div>${registration?`<div class="account-modes"><button type="button" class="mode-btn ${usernameOnly?'active':''}" data-register-mode="username">Username only</button><button type="button" class="mode-btn ${!usernameOnly?'active':''}" data-register-mode="email">Add email</button></div>`:''}<header><p class="eyebrow">${registration?'First entry · profile setup':'Welcome back · local session'}</p><h2>${registration?'Create your study space.':'Enter the study space.'}</h2><p>${registration?'Set up a browser-local profile in under a minute.':'Your dashboard stays on this device, ready when you are.'}</p></header><form id="auth-form">${formFields}<button class="primary-btn" id="auth-submit" type="submit">${registration?'Create account':'Log in'} ${icon('arrow')}</button>${!registration?`<div class="auth-divider"><span>or continue with</span></div><button type="button" class="google-btn" data-google-login><span class="google-mark">G</span> Continue with Google</button><p class="google-note">${remote?'Google sign-in uses Firebase Authentication.':'Google Login placeholder · add your client key later'}</p>`:''}<div class="auth-hint" id="auth-message">${fileBlocked?'Firebase is configured, but this page was opened with file://. Start an HTTP server and open http://localhost:5500/ instead.':''}</div></form><div class="auth-footer">${remote?'Authentication uses Firebase for account security.':'Authentication is local/browser-based and does not provide server-side security.'}</div></section></div></main>`;
-}
-function renderAuth(mode){document.getElementById('app').innerHTML=authScreen(mode);bindAuth(mode)}
-function bindAuth(mode){
- const remote=firebaseConfigPresent();
- document.querySelectorAll('[data-auth]').forEach(b=>b.addEventListener('click',()=>renderAuth(b.dataset.auth)));
- document.querySelectorAll('[data-google-login]').forEach(b=>b.addEventListener('click',async()=>{if(remote){if(firebaseBlockedByFile()){toast('Firebase Google Login needs http:// or https://. Start START_LOCAL_SERVER.bat and open http://localhost:5500/.',true);return}const auth=ensureFirebaseAuth();if(!auth){toast('Firebase SDK is not ready. Check your internet connection and Firebase config.',true);return}try{const provider=new window.firebase.auth.GoogleAuthProvider();await auth.signInWithPopup(provider)}catch(error){toast(error.message||'Google sign-in failed.',true)}}else if(!GOOGLE_CLIENT_ID){toast('Google Login is ready for your key, but is not configured yet.',true)}else toast('Connect your Google OAuth flow here.',true)}));
- const back=document.getElementById('back-login');if(back)back.onclick=()=>renderAuth('login');
- const reset=document.getElementById('reset-account');if(reset)reset.onclick=()=>{if(confirm('Reset the local account saved in this browser? Your study content will remain unless manually cleared.')){localStorage.removeItem(KEY.account);localStorage.removeItem(KEY.session);localStorage.removeItem(KEY.profile);renderAuth('register')}};
- const forgot=document.getElementById('forgot');if(forgot)forgot.onclick=async()=>{if(remote){const email=prompt('Enter your Firebase account email');if(!email)return;try{await ensureFirebaseAuth().sendPasswordResetEmail(email.trim());toast('Password reset email sent.')}catch(error){toast(error.message||'Unable to send reset email.',true)}}else renderAuth('recovery')};
- const toggle=document.getElementById('toggle-password');if(toggle)toggle.onclick=()=>{const i=document.getElementById('auth-password');i.type=i.type==='password'?'text':'password';toggle.title=i.type==='password'?'Show password':'Hide password'};
- const form=document.getElementById('auth-form');if(!form)return;
- const identity=document.getElementById('auth-identity');const valid=document.getElementById('identity-valid');
- identity.addEventListener('input',()=>valid.classList.toggle('valid',identity.value.trim().length>2));
- document.querySelectorAll('[data-register-mode]').forEach(b=>b.addEventListener('click',()=>{state.registerMode=b.dataset.registerMode;renderAuth('register')}));
- if(document.getElementById('auth-confirm'))document.getElementById('auth-confirm').addEventListener('input',e=>document.getElementById('confirm-valid').classList.toggle('valid',e.target.value===document.getElementById('auth-password').value&&e.target.value.length>0));
- form.addEventListener('submit',e=>{e.preventDefault();const message=document.getElementById('auth-message');const submit=document.getElementById('auth-submit');const data=Object.fromEntries(new FormData(form).entries());submit.disabled=true;submit.innerHTML='Checking your access…';if(remote){firebaseAuthSubmit(mode,data,message,submit);return}setTimeout(()=>{if(mode==='register'){if(!data.name||String(data.name).trim().length<2)return authError(message,submit,'Add your name to initialize the profile.');if(String(data.password).length<6)return authError(message,submit,'Use a password with at least 6 characters.');if(data.password!==data.confirm)return authError(message,submit,'Passwords do not match.');if(String(data.identity||'').trim().length<3)return authError(message,submit,'Add a username or email with at least 3 characters.');const identityValue=String(data.identity||'').trim();const emailMode=state.registerMode==='email';if(emailMode&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identityValue))return authError(message,submit,'Enter a valid email address.');const emailValue=(emailMode?identityValue:String(data.email||'').trim()).toLowerCase();const acc={name:String(data.name).trim(),username:emailMode?emailValue:identityValue,email:emailValue,loginId:emailMode?emailValue:identityValue,password:String(data.password),createdAt:new Date().toISOString()};set(KEY.account,acc);state.profile={name:acc.name,email:acc.email||acc.username,username:acc.username,semester:Number(data.semester)||3,branch:String(data.branch||'Computer Engineering'),college:'GTU Diploma'};set(KEY.profile,state.profile);set(KEY.session,{active:true,remember:true,at:Date.now()});showTransition('Welcome to your study space.',()=>renderApp())}else{const acc=account();const loginValue=String(data.identity||'').trim().toLowerCase();const knownIds=[acc&&acc.username,acc&&acc.loginId,acc&&acc.identity,acc&&acc.email].filter(Boolean).map(v=>String(v).trim().toLowerCase());if(!acc||!knownIds.includes(loginValue)||data.password!==acc.password)return authError(message,submit,'That local username or password is not a match.');const remember=document.getElementById('remember')?.checked;set(KEY.session,{active:true,remember:!!remember,at:Date.now()});state.profile=activeProfile();showTransition('Welcome back.',()=>renderApp())}},480)})}
-async function firebaseAuthSubmit(mode,data,message,submit){if(firebaseBlockedByFile())return authError(message,submit,'Firebase login needs an http:// or https:// page. Do not open index.html with file://.');const auth=ensureFirebaseAuth();if(!auth)return authError(message,submit,'Firebase is not configured.');try{const email=String(data.identity||'').trim();const password=String(data.password||'');if(!email.includes('@'))return authError(message,submit,'Enter a valid email address.');if(password.length<6)return authError(message,submit,'Use a password with at least 6 characters.');if(mode==='register'){if(!data.name||String(data.name).trim().length<2)return authError(message,submit,'Add your name to initialize the profile.');if(password!==String(data.confirm||''))return authError(message,submit,'Passwords do not match.');const credential=await auth.createUserWithEmailAndPassword(email,password);if(credential.user)await credential.user.updateProfile({displayName:String(data.name).trim()});state.profile={name:String(data.name).trim(),email,semester:Number(data.semester)||3,branch:String(data.branch||'Computer Engineering'),college:'GTU Diploma'};saveAll();toast('Firebase account created.')}else{await auth.signInWithEmailAndPassword(email,password);toast('Welcome back.')}}catch(error){authError(message,submit,error.code==='auth/email-already-in-use'?'That email already has an account.':error.code==='auth/invalid-credential'?'That email or password is not a match.':error.code==='auth/weak-password'?'Use a password with at least 6 characters.':error.message||'Firebase authentication failed.')}}
+/* ============================================================
+   GTU PREP — Semester 3 exam preparation tracker
+   Vanilla JS · localStorage · works from file:// directly
+   ============================================================ */
+(function () {
+  "use strict";
 
-function authError(message,submit,text){submit.disabled=false;submit.innerHTML='Try again '+icon('arrow');message.className='auth-hint error';message.textContent=text;const card=document.querySelector('.auth-card');card.animate([{transform:'perspective(1200px) translateX(0)'},{transform:'perspective(1200px) translateX(-5px)'},{transform:'perspective(1200px) translateX(5px)'},{transform:'perspective(1200px) translateX(0)'}],{duration:280})}
-function navItems(){return [{id:'dashboard',label:'Dashboard',icon:'dashboard'},{id:'syllabus',label:'Syllabus',icon:'book'},{id:'notes',label:'Notes',icon:'note'},{id:'tasks',label:'Tasks',icon:'task'},{id:'shared',label:'Shared With Me',icon:'share'}]}
-function resourceItems(){return [{id:'assignmentFiles',label:'Assignments',icon:'file',scope:'assignments'},{id:'solutions',label:'Solutions',icon:'badge',scope:'solutions'},{id:'papers',label:'Exam Papers',icon:'file',scope:'papers'},{id:'timetable',label:'Timetable',icon:'calendar'}]}
-function sideButton(item){return '<button class="'+(state.view===item.id?'active':'')+'" data-view="'+item.id+'">'+icon(item.icon)+'<span>'+item.label+'</span></button>'}
-function appShell(){const p=state.profile;return '<div class="app-shell"><div class="mobile-top"><div class="mobile-brand"><span class="brand-symbol"></span><b>GTU HUB</b></div><div class="mobile-actions"><button class="top-btn" data-theme aria-label="Toggle theme">'+icon(state.theme==='dark'?'sun':'moon')+'</button><button class="top-btn avatar" data-view="profile" aria-label="Open profile">'+esc(initials(p.name))+'</button></div></div><div class="app-layout"><aside class="sidebar"><button class="brand-button" data-view="dashboard"><span class="brand-symbol"></span><span><b>GTU DIPLOMA</b><small>STUDY SPACE</small></span></button><p class="nav-label">Workspace</p><nav class="side-nav">'+navItems().map(sideButton).join('')+'</nav><p class="nav-label">Libraries</p><nav class="side-nav">'+resourceItems().map(sideButton).join('')+'</nav><div class="side-bottom"><nav class="side-nav side-bottom-nav"><button data-view="profile">'+icon('user')+'<span>Profile</span></button><button data-view="settings">'+icon('settings')+'<span>Settings</span></button></nav><div class="term-badge"><span>ACTIVE TERM</span><strong>Semester '+state.semester+'</strong></div></div></aside><div class="main-area"><header class="topbar"><div class="context">'+icon('search')+'<div><span>GTU Diploma workspace</span><strong>'+contextTitle()+'</strong></div></div><div class="top-actions"><span class="saved"><i></i> Saved locally</span><button class="top-btn" data-theme aria-label="Toggle theme">'+icon(state.theme==='dark'?'sun':'moon')+'</button><button class="profile-btn" data-profile-menu aria-expanded="'+state.profileMenu+'"><span class="avatar">'+esc(initials(p.name))+'</span><b>'+esc(p.name||'Student')+'</b>'+icon('chevron')+'</button>'+ (state.profileMenu?profileMenu():'')+'</div></header><main class="content"><div id="page" class="pagein">'+pageMarkup()+'</div></main></div></div><nav class="mobile-bottom">'+[{id:'dashboard',label:'Home',icon:'dashboard'},{id:'syllabus',label:'Syllabus',icon:'book'},{id:'notes',label:'Notes',icon:'note'},{id:'settings',label:'More',icon:'settings'},{id:'profile',label:'Profile',icon:'user'}].map(i=>'<button class="'+(state.view===i.id?'active':'')+'" data-view="'+i.id+'">'+icon(i.icon)+'<span>'+i.label+'</span></button>').join('')+'</nav></div>'}
-function contextTitle(){const m={dashboard:'Overview',syllabus:'Syllabus Tracker',notes:'Study Notes',tasks:'Tasks',assignmentFiles:'Assignments',solutions:'Solutions',papers:'Exam Papers',timetable:'Timetable',profile:'My Profile',settings:'Settings',shared:'Shared With Me'};return m[state.view]||'Workspace'}
-function profileMenu(){return '<div class="profile-menu"><div class="identity"><span class="avatar">'+esc(initials(state.profile.name))+'</span><div><strong>'+esc(state.profile.name||'Student')+'</strong><small>'+esc(state.profile.email||'Local account')+'</small></div></div><button data-view="profile">'+icon('user')+' Profile</button><button data-logout>'+icon('x')+' Log out</button></div>'}
-function pageMarkup(){if(state.view==='shared')return sharedPage();if(state.view==='dashboard')return dashboard();if(state.view==='syllabus')return syllabus();if(state.view==='notes')return notes();if(state.view==='tasks')return tasks();if(['assignmentFiles','solutions','papers'].includes(state.view))return files(state.view);if(state.view==='timetable')return timetable();if(state.view==='profile')return profile();return settings()}
-function heading(eyebrow,title,description,action){return '<section class="workspace-heading"><div><p class="eyebrow">'+esc(eyebrow)+'</p><h1>'+esc(title)+'</h1><p>'+esc(description)+'</p></div>'+(action||'')+'</section>'}
-function dashboard(){const ss=subjects(),prog=overall(),units=ss.reduce((n,s)=>n+s.units.length,0);return '<section>'+ '<div class="heading"><div><p class="eyebrow">Semester '+state.semester+' · GTU Diploma</p><h1>Study Command Center</h1><p>Keep unit coverage, saved material, and your next academic action in focus.</p></div><label class="select-label">Semester<select id="semester-select">'+[1,2,3,4,5].map(n=>'<option value="'+n+'" '+(n===state.semester?'selected':'')+'>Semester '+n+'</option>').join('')+'</select></label></div><div class="dashboard-grid"><aside class="rail"><section class="card rail-card"><div class="rail-head"><h2>Study Tasks</h2><button data-view="tasks">'+icon('plus')+'</button></div><div class="empty-mini">'+icon('task')+'<span>'+ (state.tasks.filter(t=>!t.done).length?state.tasks.filter(t=>!t.done).length+' active tasks':'No active tasks')+'</span><small>Use Tasks to plan coursework.</small></div></section><section class="card rail-card"><div class="rail-head"><h2>Recent Activity</h2></div><div class="empty-mini">'+icon('badge')+'<span>'+((state.notes.length||state.files.length)?'Workspace is active':'No recent activity')+'</span><small>Activity stays local to this browser.</small></div></section><section class="card rail-card"><div class="rail-head"><h2>Quick Access</h2></div><div class="rail-quick-grid">'+[{id:'syllabus',label:'Syllabus',icon:'book'},{id:'notes',label:'Notes',icon:'note'},{id:'tasks',label:'Tasks',icon:'task'},{id:'timetable',label:'Timetable',icon:'calendar'}].map(i=>'<button data-view="'+i.id+'">'+icon(i.icon)+'<span>'+i.label+'</span></button>').join('')+'</div></section></aside><div class="dashboard-main"><div class="stats"><div class="card stat blue"><div class="stat-top"><span>Syllabus progress</span><i>'+icon('book')+'</i></div><strong>'+prog+'%</strong><small>Completion weight</small><div class="stat-progress"><i style="width:'+prog+'%"></i></div></div><div class="card stat amber"><div class="stat-top"><span>Subjects</span><i>'+icon('badge')+'</i></div><strong>'+ss.length+'</strong><small>Total subjects</small></div><div class="card stat gold"><div class="stat-top"><span>Units / chapters</span><i>'+icon('file')+'</i></div><strong>'+units+'</strong><small>Total units</small></div><div class="card stat coral"><div class="stat-top"><span>Exam readiness</span><i>'+icon('calendar')+'</i></div><strong>—</strong><small>No preparation record</small></div></div><section class="card hero"><div class="hero-copy"><p class="eyebrow">My Study Progress</p><h2>Study the next unit. Move the semester forward.</h2><p>Each completed unit updates the weighted progress that belongs to your GTU syllabus.</p><button class="soft-btn" data-view="syllabus">Continue unit tracker '+icon('arrow')+'</button></div><div class="hero-metrics">'+ring(prog)+'<div class="metric"><strong>'+ss.length+'</strong><span>Subjects</span></div><div class="metric"><strong>'+units+'</strong><span>Units</span></div></div></section><div class="canvas-grid"><section class="card panel course-panel"><div class="section-head"><div><p class="eyebrow">Semester snapshot</p><h2>Course Progress</h2></div><button class="muted-action" data-view="syllabus">View tracker '+icon('arrow')+'</button></div><div class="course-list">'+(ss.length?ss.map(s=>'<div class="course-row"><span class="subject '+s.color+'">'+esc(s.name.slice(0,2).toUpperCase())+'</span><div class="course-title"><strong>'+esc(s.name)+'</strong><span>'+s.units.length+' units</span></div><div class="bar"><i style="width:'+subjectProgress(s)+'%"></i></div><b>'+subjectProgress(s)+'%</b></div>').join(''):'<div class="empty-state">'+icon('book')+'<h2>No syllabus in this semester</h2><p>Choose a semester with supplied curriculum.</p></div>')+'</div></section><aside class="quick-panel"><section class="card panel"><div class="section-head"><div><p class="eyebrow">Study tools</p><h2>Continue your syllabus</h2></div></div><div class="quick-grid">'+[{id:'syllabus',label:'Study Syllabus',desc:'Track units and chapters',c:'q-blue',i:'book'},{id:'notes',label:'Study Notes',desc:'Capture useful explanations',c:'q-violet',i:'note'},{id:'tasks',label:'Task Planner',desc:'Keep the next action clear',c:'q-amber',i:'task'},{id:'solutions',label:'Solutions',desc:'Open saved revision files',c:'q-aqua',i:'badge'}].map(i=>'<button class="quick '+i.c+'" data-view="'+i.id+'">'+icon(i.i)+'<span>'+i.label+'</span><small>'+i.desc+'</small></button>').join('')+'</div></section><section class="card mini-empty"><div class="section-head"><div><p class="eyebrow">Planning</p><h2>Next academic action</h2></div>'+icon('calendar')+'</div><p>'+(state.tasks.length?'Your task list is ready.':'No scheduled work yet.')+'</p><small>Add real assignment dates or timetable slots to keep the semester moving.</small></section></aside></div></div></div></section>'}
-function ring(value){const r=30,c=2*Math.PI*r,offset=c-(value/100)*c;return '<div class="ring"><svg viewBox="0 0 72 72" aria-label="'+value+' percent complete"><circle class="track" cx="36" cy="36" r="30" fill="none" stroke-width="5"/><circle class="value" cx="36" cy="36" r="30" fill="none" stroke-width="5" stroke-dasharray="'+c+'" stroke-dashoffset="'+offset+'"/></svg><b>'+value+'%</b></div>'}
-function syllabus(){const filtered=subjects().filter(s=>s.name.toLowerCase().includes(state.query.toLowerCase()));return '<section class="workspace">'+heading('Semester '+state.semester,'Syllabus Tracker','Track unit completion and let every subject contribute to your actual semester progress.','<label class="search">'+icon('search')+'<input id="workspace-search" placeholder="Search subject…" value="'+esc(state.query)+'"></label>')+'<div class="syllabus-list">'+(filtered.length?filtered.map(s=>{const open=state.openSubject===s.code||(!state.openSubject&&s===filtered[0]);return '<article class="card syllabus-card '+(open?'open':'')+'"><button class="syllabus-head" data-subject="'+s.code+'" aria-expanded="'+open+'"><span class="subject '+s.color+'">'+esc(s.name.slice(0,2).toUpperCase())+'</span><span class="syllabus-name"><strong>'+esc(s.name)+'</strong><small>'+s.code+' · '+s.units.length+' units</small></span><span class="syllabus-progress"><b>'+subjectProgress(s)+'%</b><span class="bar"><i style="width:'+subjectProgress(s)+'%"></i></span></span>'+icon('chevron')+'</button>'+(open&&s.units.length?'<div class="chapter-list">'+s.units.map((u,i)=>{const done=!!state.progress[state.semester+'::'+s.code+'::'+i];return '<button class="chapter '+(done?'done':'')+'" data-chapter="'+s.code+'::'+i+'"><span class="chapter-check">'+(done?icon('check'):'')+'</span><span>'+((i+1)+'. '+esc(u))+'</span><small>Unit '+(i+1)+' · '+unitWeight(s,i)+'% weight</small></button>'}).join('')+'</div>':open?'<div class="chapter-list"><div class="empty-mini"><span>No unit outline supplied for this subject.</span></div></div>':'')+'</article>'}).join(''):'<div class="card empty-state">'+icon('search')+'<h2>No subjects found</h2><p>Try a different subject name or clear the search.</p></div>')+'</div></section>'}
-function notes(){return '<section class="workspace">'+heading('Personal library','Study Notes','Save concise study notes locally and return to them without leaving your semester workspace.','<label class="search">'+icon('search')+'<input id="workspace-search" placeholder="Search notes…" value="'+esc(state.query)+'"></label>')+'<div class="two-col"><form class="card composer" id="note-form"><p class="eyebrow">New note</p><h2>Capture the useful part.</h2><input name="title" placeholder="Note title" aria-label="Note title" required><textarea name="body" placeholder="Write a short study note…" aria-label="Note content"></textarea><button class="soft-btn" type="submit">'+icon('plus')+' Save note</button></form><div class="list">'+(state.notes.filter(n=>(n.title+' '+n.body).toLowerCase().includes(state.query.toLowerCase())).map(n=>'<article class="card note"><div class="note-top">'+icon('note')+'<button class="delete" data-delete-note="'+n.id+'" aria-label="Delete '+esc(n.title)+'">×</button></div><h3>'+esc(n.title)+'</h3><p>'+esc(n.body||'No additional details.')+'</p><small>Saved '+new Date(n.updatedAt).toLocaleDateString()+'</small></article>').join('')||'<div class="card empty-state">'+icon('note')+'<h2>No study notes yet</h2><p>Create a note to keep important explanations, formulas, or revision prompts in this browser.</p></div>')+'</div></div></section>'}
-function tasks(){return '<section class="workspace">'+heading('Semester '+state.semester+' · Study planning','Tasks','Daily study actions and personal deadlines, kept simple. College assignment PDFs live in the Assignments library.','<button class="soft-btn" data-view="assignmentFiles">'+icon('file')+' Assignment PDFs</button>')+'<div class="two-col"><form class="card composer" id="task-form"><p class="eyebrow">New task</p><h2>What will you finish next?</h2><input name="title" placeholder="e.g. Revise Networks Unit 3" required><div class="field-grid"><select name="subject"><option value="">Choose a subject</option>'+subjects().map(s=>'<option>'+esc(s.name)+'</option>').join('')+'</select><label class="date-field">Target date<input name="due" type="date"></label></div><button class="soft-btn" type="submit">'+icon('plus')+' Add task</button></form><div class="list">'+(state.tasks.map(t=>'<article class="card task '+(t.done?'done':'')+'"><button class="task-toggle" data-toggle-task="'+t.id+'" aria-label="Mark '+esc(t.title)+' '+(t.done?'incomplete':'complete')+'">'+(t.done?icon('check'):'')+'</button><div><p class="eyebrow">'+(t.done?'Completed':'Study task')+'</p><h3>'+esc(t.title)+'</h3><p>'+esc(t.subject||'General study')+(t.due?' · Target '+new Date(t.due+'T00:00:00').toLocaleDateString():'')+'</p></div><button class="delete" data-delete-task="'+t.id+'" aria-label="Delete '+esc(t.title)+'">×</button></article>').join('')||'<div class="card empty-state">'+icon('task')+'<h2>No tasks yet</h2><p>Add a study task. Use the Assignments library for college PDFs.</p></div>')+'</div></div></section>'}
-function libraryPath(scope,folderId){const out=[];let current=folderId;while(current){const f=state.folders.find(x=>x.id===current&&x.scope===scope);if(!f)break;out.unshift(f);current=f.parentId||null}return out}
-function fileMenu(type,id){return '<div class="resource-menu"><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="preview">'+icon('eye')+' View / Preview</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="download">'+icon('download')+' Download</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="copy">'+icon('link')+' Copy Link</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="share">'+icon('share')+' Share</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="rename">Rename</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="move">'+icon('move')+' Move</button><button class="danger" data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="delete">Delete</button></div>'}
-function shareUrl(type,id){const token=state.shares.find(x=>x.type===type&&x.resourceId===id)?.token||id;return location.href.split('#')[0]+'#shared='+encodeURIComponent(token)}
-function libraryPath(scope,folderId){const out=[];let current=folderId;while(current){const f=state.folders.find(x=>x.id===current&&x.scope===scope);if(!f)break;out.unshift(f);current=f.parentId||null}return out}
-function fileMenu(type,id){return '<div class="resource-menu"><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="preview">'+icon('eye')+' View / Preview</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="download">'+icon('download')+' Download</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="copy">'+icon('link')+' Copy Link</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="share">'+icon('share')+' Share</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="rename">Rename</button><button data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="move">'+icon('move')+' Move</button><button class="danger" data-resource-action="'+type+'" data-resource-id="'+id+'" data-action="delete">Delete</button></div>'}
-function shareUrl(type,id){const token=state.shares.find(x=>x.type===type&&x.resourceId===id)?.token||id;return location.href.split('#')[0]+'#shared='+encodeURIComponent(token)}
-function files(view){const meta={assignmentFiles:['Assignments','College assignment PDFs and related files, kept in a separate browser-local library.','assignments','Build your assignment shelf.'],solutions:['Solutions','Organize solution PDFs, code files, and revision material into folders.','solutions','Bring your preparation together.'],papers:['Exam Papers','Keep previous papers and related files in one focused library.','papers','Build your paper library.']}[view];const scope=meta[2],path=libraryPath(scope,state.activeFolderId),current=path.length?path[path.length-1]:null;const parentId=current?current.id:null;const folders=state.folders.filter(f=>f.scope===scope&&(f.parentId||null)===parentId);const list=state.files.filter(f=>f.scope===scope&&(f.parentId||null)===parentId&&(f.name||'').toLowerCase().includes(state.query.toLowerCase()));return '<section class="workspace library-page">'+heading('Semester '+state.semester+' · Library',meta[0],meta[1],'<div class="library-actions"><button class="soft-btn" data-create-folder="'+scope+'">'+icon('folder')+' Create folder</button><label class="upload-btn">'+icon('upload')+' Upload files<input id="file-upload" type="file" multiple accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.zip,.py,.c,.html"></label></div>')+'<div class="library-toolbar"><div class="breadcrumbs"><button data-library-root="'+scope+'">'+meta[0]+'</button>'+path.map(f=>'<span>/</span><button data-open-folder="'+f.id+'">'+esc(f.name)+'</button>').join('')+'</div><label class="search">'+icon('search')+'<input id="workspace-search" placeholder="Search this folder…" value="'+esc(state.query)+'"></label></div><div class="drop-zone" id="drop-zone">Drop files here to upload to <strong>'+esc(current?current.name:meta[0])+'</strong></div><section class="card vault-hero"><div><p class="eyebrow">Private section storage</p><h2>'+meta[3]+'</h2><p>Folders and files stay isolated inside <strong>'+meta[0]+'</strong>. Shared links reference this original item without moving or duplicating it.</p></div>'+icon('folder')+'</section><div class="resource-grid">'+(folders.map(f=>'<article class="card resource-card folder-card" data-open-folder="'+f.id+'"><div class="resource-icon folder-tone">'+icon('folder')+'</div><div class="file-main"><h3>'+esc(f.name)+'</h3><p>Folder · '+state.files.filter(x=>x.scope===scope&&x.parentId===f.id).length+' files</p></div><button class="more-btn" data-menu-toggle="folder-'+f.id+'" aria-label="Folder options">'+icon('more')+'</button>'+fileMenu('folder',f.id)+'</article>').join('')||'')+(list.map(f=>'<article class="card resource-card"><div class="resource-icon">'+icon('file')+'</div><div class="file-main"><h3>'+esc(f.name)+'</h3><p>'+esc(f.sizeText||'File')+' · Added '+new Date(f.addedAt).toLocaleDateString()+'</p></div>'+(f.data?'<button class="top-btn" data-download="'+f.id+'" aria-label="Download '+esc(f.name)+'">'+icon('download')+'</button>':'')+'<button class="more-btn" data-menu-toggle="file-'+f.id+'" aria-label="File options">'+icon('more')+'</button>'+fileMenu('file',f.id)+'</article>').join('')||'')+'</div>'+(!folders.length&&!list.length?'<div class="card empty-state">'+icon('folder')+'<h2>This folder is empty</h2><p>Create a folder or drop files here to start organizing '+meta[0].toLowerCase()+'.</p></div>':'')+'</section>'}
-function sharedPage(){const links=state.shares.filter(s=>s.shared||s.createdBy);return '<section class="workspace">'+heading('Workspace library','Shared With Me','Shared links stay connected to their original section and never duplicate the source file.','')+'<div class="list">'+(links.map(s=>'<article class="card file"><div class="file-icon">'+icon(s.type==='folder'?'folder':'share')+'</div><div class="file-main"><h3>'+esc(s.name||'Shared resource')+'</h3><p>'+esc(s.scope)+' · '+(s.type==='folder'?'Folder':'File')+' · '+new Date(s.createdAt).toLocaleDateString()+'</p></div><button class="soft-btn" data-open-share="'+s.token+'">Open link</button></article>').join('')||'<div class="card empty-state">'+icon('share')+'<h2>No shared resources yet</h2><p>Use Share on a file or folder to create a link. Shared resources will appear here.</p></div>')+'</div></section>'}
-function timetable(){const days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];return '<section class="workspace">'+heading('Semester '+state.semester+' · Weekly plan','Timetable','Class, revision, and submission blocks in one clear weekly view.')+'<div class="timetable"><form class="card composer" id="time-form"><p class="eyebrow">Add time slot</p><h2>Make the next study block clear.</h2><input name="title" placeholder="Class or revision block" required><div class="field-grid"><select name="day">'+days.map(d=>'<option>'+d+'</option>').join('')+'</select><input name="time" type="time" value="09:00"></div><select name="subject"><option value="">General study</option>'+subjects().map(s=>'<option>'+esc(s.name)+'</option>').join('')+'</select><button class="soft-btn" type="submit">'+icon('plus')+' Add time slot</button></form><div class="days">'+days.map(d=>'<section class="card day"><h3>'+d+'</h3>'+((state.timetable.filter(t=>t.day===d).sort((a,b)=>a.time.localeCompare(b.time)).map(t=>'<article class="slot"><time>'+esc(t.time)+'</time><div><strong>'+esc(t.title)+'</strong><span>'+esc(t.subject||'General')+'</span></div><button data-delete-slot="'+t.id+'">×</button></article>').join(''))||'<p>No scheduled slots.</p>')+'</section>').join('')+'</div></div></section>'}
-function profile(){const p=state.profile;return '<section class="workspace">'+heading('Student profile','My Profile','Personalise the study space shown in the GTU Diploma Syllabus Hub.')+'<form class="card profile-card" id="profile-form"><div class="profile-id"><span class="large-avatar">'+esc(initials(p.name))+'</span><div><p class="eyebrow">Student profile</p><h2>'+esc(p.name||'GTU Student')+'</h2><p>'+esc(p.college||'GTU Diploma')+' · Semester '+p.semester+'</p></div></div><div class="profile-form"><label>Full name<input name="name" value="'+esc(p.name)+'" required></label><label>Local username / email<input name="email" value="'+esc(p.email)+'" required></label><label>Branch<input name="branch" value="'+esc(p.branch||'Computer Engineering')+'"></label><label>College / programme<input name="college" value="'+esc(p.college||'GTU Diploma')+'"></label><label>Semester<select name="semester">'+[1,2,3,4,5].map(n=>'<option value="'+n+'" '+(n===Number(p.semester)?'selected':'')+'>Semester '+n+'</option>').join('')+'</select></label></div><button class="soft-btn" type="submit">'+icon('check')+' Save profile</button></form></section>'}
-function settings(){return '<section class="workspace">'+heading('Workspace preferences','Settings','Keep the visual system comfortable while the academic data remains local to this browser.')+'<div class="settings"><section class="card setting"><div><p class="eyebrow">Appearance</p><h2>'+ (state.theme==='dark'?'Teal workspace':'Light study mode')+'</h2><p>Switch between the teal workspace canvas and a brighter study mode.</p></div><button class="switch '+(state.theme==='dark'?'on':'')+'" data-theme aria-label="Toggle theme"></button></section><section class="card setting"><div><p class="eyebrow">Account</p><h2>Local account recovery</h2><p>Reset the browser-local sign-in identity without deleting study content.</p></div><button class="soft-btn" data-recovery>Reset access</button></section><section class="card setting"><div><p class="eyebrow">Data honesty</p><h2>Private to this browser</h2><p>Authentication and dashboard content use localStorage. This package does not provide server-side security or cloud sync.</p></div>'+icon('lock')+'</section></div></section>'}
-function renderApp(){const token=publicToken();if(token){if(!publicShareLoading)renderPublicSharePage(token);return}const sess=currentSession();if(firebaseConfigPresent()){if(!firebaseUser){renderAuth('login');return}}else if(!sess||!sess.active){renderAuth(hasAccount()?'login':'register');return}state.profile=activeProfile();const settings=get(KEY.settings,{});state.theme=settings.theme||state.theme;document.body.classList.toggle('light',state.theme==='light');document.getElementById('app').innerHTML=appShell();bindApp()}
-function bindApp(){const remote=firebaseConfigPresent();document.querySelectorAll('[data-view]').forEach(el=>el.addEventListener('click',()=>setView(el.dataset.view)));document.querySelectorAll('[data-theme]').forEach(el=>el.addEventListener('click',()=>{state.theme=state.theme==='dark'?'light':'dark';set(KEY.settings,{theme:state.theme});renderApp()}));const pbtn=document.querySelector('[data-profile-menu]');if(pbtn)pbtn.onclick=()=>{state.profileMenu=!state.profileMenu;renderApp()};const logout=document.querySelector('[data-logout]');if(logout)logout.onclick=()=>{if(remote){ensureFirebaseAuth().signOut().catch(error=>toast(error.message||'Unable to sign out.',true));return}set(KEY.session,{active:false,remember:false,at:Date.now()});showTransition('Until next time.',()=>renderAuth('login'))};const sel=document.getElementById('semester-select');if(sel)sel.onchange=()=>{state.semester=Number(sel.value);state.profile.semester=state.semester;saveAll();renderApp()};const search=document.getElementById('workspace-search');if(search){search.oninput=()=>{state.query=search.value;renderApp();const el=document.getElementById('workspace-search');if(el){el.focus();el.setSelectionRange(state.query.length,state.query.length)}}}document.querySelectorAll('[data-subject]').forEach(el=>el.onclick=()=>{state.openSubject=state.openSubject===el.dataset.subject?null:el.dataset.subject;renderApp()});document.querySelectorAll('[data-chapter]').forEach(el=>el.onclick=()=>{state.progress[state.semester+'::'+el.dataset.chapter]=!state.progress[state.semester+'::'+el.dataset.chapter];saveAll();renderApp()});const nf=document.getElementById('note-form');if(nf)nf.onsubmit=e=>{e.preventDefault();const d=Object.fromEntries(new FormData(nf));state.notes.unshift({id:id(),title:String(d.title).trim(),body:String(d.body||'').trim(),updatedAt:new Date().toISOString()});saveAll();toast('Study note saved in this browser.');renderApp()};document.querySelectorAll('[data-delete-note]').forEach(el=>el.onclick=()=>{state.notes=state.notes.filter(n=>n.id!==el.dataset.deleteNote);saveAll();renderApp()});const tf=document.getElementById('task-form');if(tf)tf.onsubmit=e=>{e.preventDefault();const d=Object.fromEntries(new FormData(tf));state.tasks.unshift({id:id(),title:String(d.title).trim(),subject:String(d.subject||''),due:String(d.due||''),done:false});saveAll();toast('Task added.');renderApp()};document.querySelectorAll('[data-toggle-task]').forEach(el=>el.onclick=()=>{const t=state.tasks.find(x=>x.id===el.dataset.toggleTask);if(t){t.done=!t.done;saveAll();toast(t.done?'Task completed.':'Task reopened.');renderApp()}});document.querySelectorAll('[data-delete-task]').forEach(el=>el.onclick=()=>{state.tasks=state.tasks.filter(t=>t.id!==el.dataset.deleteTask);saveAll();renderApp()});const uf=document.getElementById('file-upload');if(uf)uf.onchange=()=>{uploadFiles(uf.files,uf.closest('label'));uf.value=''};const dz=document.getElementById('drop-zone');if(dz){['dragenter','dragover'].forEach(e=>dz.addEventListener(e,x=>{x.preventDefault();dz.classList.add('is-dragging')}));['dragleave','drop'].forEach(e=>dz.addEventListener(e,x=>{x.preventDefault();dz.classList.remove('is-dragging')}));dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files,dz))}document.querySelectorAll('[data-create-folder]').forEach(el=>el.onclick=()=>createFolder(el.dataset.createFolder));document.querySelectorAll('[data-library-root]').forEach(el=>el.onclick=()=>{state.activeFolderId=null;state.query='';renderApp()});document.querySelectorAll('[data-open-folder]').forEach(el=>el.onclick=()=>{state.activeFolderId=el.dataset.openFolder;state.query='';renderApp()});document.querySelectorAll('[data-menu-toggle]').forEach(el=>el.onclick=e=>{e.stopPropagation();const card=el.closest('.resource-card'),menu=card.querySelector('.resource-menu');document.querySelectorAll('.resource-menu.is-open').forEach(old=>{old.classList.remove('is-open');old.style.display='none';if(old.dataset.owner){const owner=document.querySelector('[data-menu-toggle=\"'+old.dataset.owner+'\"]');if(owner){const oldCard=owner.closest('.resource-card');if(oldCard&&!oldCard.contains(old))oldCard.appendChild(old)}}});const opening=!menu.classList.contains('is-open');if(!opening){menu.classList.remove('is-open');menu.style.display='none';card.classList.remove('menu-open');return}menu.dataset.owner=el.dataset.menuToggle;menu.classList.add('is-open');card.classList.add('menu-open');document.body.appendChild(menu);menu.style.position='fixed';menu.style.display='grid';menu.style.left='0px';menu.style.top='0px';menu.style.right='auto';const r=el.getBoundingClientRect(),m=menu.getBoundingClientRect(),pad=10;let left=Math.min(Math.max(pad,r.right-m.width),window.innerWidth-m.width-pad);let top=r.bottom+7;if(top+m.height>window.innerHeight-pad)top=Math.max(pad,r.top-m.height-7);menu.style.left=Math.round(left)+'px';menu.style.top=Math.round(top)+'px'});document.querySelectorAll('[data-resource-action]').forEach(el=>el.onclick=e=>{e.stopPropagation();const type=el.dataset.resourceAction,rid=el.dataset.resourceId,action=el.dataset.action,obj=type==='file'?state.files.find(x=>x.id===rid):state.folders.find(x=>x.id===rid);if(!obj)return;if(action==='preview')return type==='file'?previewFile(obj):(()=>{state.activeFolderId=obj.id;renderApp()})();if(action==='download'){if(obj.data){const a=document.createElement('a');a.href=obj.data;a.download=obj.name;a.click();toast('Download ready.')}else toast('This large file was remembered by name only.',true);return}if(action==='copy')return copyText(shareUrl(type,obj.id));if(action==='share')return makeShare(type,obj);if(action==='rename'){const n=prompt('Rename '+type,obj.name);if(n&&n.trim()){obj.name=n.trim();saveAll();renderApp()}return}if(action==='move'){const target=prompt('Move to folder ID (leave blank for root). Available: '+state.folders.filter(f=>f.scope===obj.scope&&f.id!==obj.id).map(f=>f.name+' ['+f.id+']').join(', '),obj.parentId||'');if(target!==null){obj.parentId=target.trim()||null;saveAll();renderApp()}return}if(action==='delete'&&confirm('Delete this '+type+'?')){if(type==='file')state.files=state.files.filter(x=>x.id!==rid);else{const ids=[rid];let changed=true;while(changed){changed=false;state.folders.forEach(f=>{if(ids.includes(f.parentId)&&!ids.includes(f.id)){ids.push(f.id);changed=true}})}state.folders=state.folders.filter(x=>!ids.includes(x.id));state.files=state.files.filter(x=>!ids.includes(x.parentId))}state.shares=state.shares.filter(x=>x.resourceId!==rid);saveAll();renderApp()}});document.querySelectorAll('[data-download]').forEach(el=>el.onclick=()=>{const f=state.files.find(x=>x.id===el.dataset.download);if(f&&f.data){const a=document.createElement('a');a.href=f.data;a.download=f.name;a.click();toast('Download ready.')}});const time=document.getElementById('time-form');if(time)time.onsubmit=e=>{e.preventDefault();const d=Object.fromEntries(new FormData(time));state.timetable.push({id:id(),title:String(d.title).trim(),day:String(d.day),time:String(d.time),subject:String(d.subject||'')});saveAll();toast('Time slot added.');renderApp()};document.querySelectorAll('[data-delete-slot]').forEach(el=>el.onclick=()=>{state.timetable=state.timetable.filter(t=>t.id!==el.dataset.deleteSlot);saveAll();renderApp()});const pf=document.getElementById('profile-form');if(pf)pf.onsubmit=e=>{e.preventDefault();const d=Object.fromEntries(new FormData(pf));state.profile={...state.profile,name:String(d.name).trim(),email:String(d.email).trim(),branch:String(d.branch||''),college:String(d.college||''),semester:Number(d.semester)||3};state.semester=state.profile.semester;saveAll();toast('Profile saved in this browser.');renderApp()};const rec=document.querySelector('[data-recovery]');if(rec)rec.onclick=()=>renderAuth('recovery');document.querySelectorAll('[data-open-share]').forEach(el=>el.onclick=()=>copyText(shareUrl('file',el.dataset.openShare)));bindDepth()}
-function bindDepth(){if(window.matchMedia('(prefers-reduced-motion: reduce)').matches||!window.matchMedia('(pointer: fine)').matches)return;document.querySelectorAll('.card').forEach(card=>{card.addEventListener('pointermove',e=>{const r=card.getBoundingClientRect(),x=(e.clientX-r.left)/r.width-.5,y=(e.clientY-r.top)/r.height-.5;card.style.setProperty('--rx',(-y*1.3).toFixed(2)+'deg');card.style.setProperty('--ry',(x*1.3).toFixed(2)+'deg');card.style.transform='translateY(-3px) rotateX(var(--rx)) rotateY(var(--ry))'});card.addEventListener('pointerleave',()=>{card.style.transform='';card.style.removeProperty('--rx');card.style.removeProperty('--ry')})})}
-function uploadFiles(fileList,label){const files=Array.from(fileList||[]);if(!files.length)return;const view=state.view,scopes={assignmentFiles:'assignments',solutions:'solutions',papers:'papers'},scope=scopes[view],parentId=state.activeFolderId||null;let pending=files.length;toast('Uploading '+files.length+' file'+(files.length>1?'s':'')+'…');files.forEach(file=>{const item={id:id(),name:file.name,sizeText:Math.max(1,Math.round(file.size/1024))+' KB',addedAt:new Date().toISOString(),scope,parentId,mime:file.type||'application/octet-stream'};const finish=()=>{state.files.unshift(item);if(cloudShareReady())uploadCloudFile(file,item);if(--pending===0){saveAll();toast('Upload complete.');renderApp()}};if(file.size<=2500000){const reader=new FileReader();reader.onload=()=>{item.data=reader.result;finish()};reader.onerror=finish;reader.readAsDataURL(file)}else finish()});if(label)label.classList.add('uploading')}
-function createFolder(scope){const name=prompt('Folder name');if(!name||!name.trim())return;state.folders.unshift({id:id(),name:name.trim(),scope,parentId:state.activeFolderId||null,createdAt:new Date().toISOString()});saveAll();toast('Folder created.');renderApp()}
-function copyText(text){if(navigator.clipboard)navigator.clipboard.writeText(text).then(()=>toast('Link copied.'));else{const i=document.createElement('input');i.value=text;document.body.appendChild(i);i.select();document.execCommand('copy');i.remove();toast('Link copied.')}}
-async function makeShare(type,obj){let record=state.shares.find(x=>x.type===type&&x.resourceId===obj.id);if(!record){record={id:id(),token:id()+id(),type,resourceId:obj.id,name:obj.name,scope:obj.scope,createdAt:new Date().toISOString(),createdBy:true,shared:true};state.shares.unshift(record);saveAll()}const ok=await publishCloudShare(record,{...obj,type});if(ok){const url=location.href.split('#')[0]+'#shared='+encodeURIComponent(record.token);copyText(url);if(navigator.share)navigator.share({title:obj.name,url}).catch(()=>{});toast('Public share link copied. Open it on any device without login.')}}
-function previewFile(f){if(!f||!f.data){toast('Preview is unavailable for large files saved by name only.',true);return}const w=window.open('','_blank');if(w){w.document.write('<title>'+esc(f.name)+'</title><style>body{margin:0;background:#111;color:#fff;font:16px sans-serif}iframe,img,pre{width:100%;height:100vh;border:0;object-fit:contain}</style>');if(f.name.match(/\.(png|jpe?g|gif|webp)$/i))w.document.write('<img src="'+f.data+'">');else if(f.name.match(/\.pdf$/i))w.document.write('<iframe src="'+f.data+'"></iframe>');else w.document.write('<pre>'+esc(atob(f.data.split(',')[1]||''))+'</pre>');w.document.close()}}
-state.theme=get(KEY.settings,{theme:'dark'}).theme||'dark';document.body.classList.toggle('light',state.theme==='light');const firebaseAuth=ensureFirebaseAuth();if(publicToken()){renderPublicSharePage(publicToken());}else if(firebaseConfigPresent()){if(firebaseAuth){firebaseAuth.onAuthStateChanged(user=>{firebaseUser=user;cloudReady=false;if(user){const profile=activeProfile();if((!profile.name||profile.name==='GTU Student')&&user.displayName){state.profile={...profile,name:user.displayName,email:user.email||profile.email};set(KEY.profile,state.profile)}loadCloudState().then(()=>renderApp()).catch(()=>renderApp())}else renderAuth('login')})}else renderAuth('login')}else if(currentSession()&&currentSession().active&&currentSession().remember){renderApp()}else{if(currentSession()&&currentSession().active&&!currentSession().remember)localStorage.removeItem(KEY.session);renderAuth(hasAccount()?'login':'register')}
+  const LS_KEY = "gtu-prep-v1";
+  const DATA = window.GTU_DATA;
+
+  /* ---------------- state ---------------- */
+  const defaultState = () => ({ completed: {}, revision: {}, theme: "light" });
+  let state = loadState();
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return defaultState();
+      const parsed = JSON.parse(raw);
+      return {
+        completed: parsed.completed || {},
+        revision: parsed.revision || {},
+        theme: parsed.theme === "dark" ? "dark" : "light",
+      };
+    } catch {
+      return defaultState();
+    }
+  }
+  function save() {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch { /* storage full */ }
+  }
+
+  /* ---------------- question index ---------------- */
+  const subjects = DATA.subjects;
+  const allQuestions = [];
+
+  subjects.forEach((sub) => {
+    sub.questionBank.forEach((q) => {
+      allQuestions.push({
+        id: `${sub.id}-QB-${q.no}`,
+        subject: sub.id,
+        subjectName: sub.name,
+        sourceKey: "QB",
+        sourceName: "Question Bank",
+        num: q.no,
+        label: `Q${q.no}`,
+        or: false,
+        marks: null,
+        co: q.co,
+        bl: q.bl,
+        text: q.text,
+        table: false,
+      });
+    });
+    sub.papers.forEach((p) => {
+      const pk = `${p.season === "Summer" ? "S" : "W"}${p.year}`;
+      const pname = `${p.season} ${p.year} GTU Paper`;
+      p.questions.forEach((q) => {
+        allQuestions.push({
+          id: `${sub.id}-${pk}-${q.q}-${q.label.includes("OR") ? "or" : "m"}-${q.label.replace(/[^a-z0-9]/gi, "")}`,
+          subject: sub.id,
+          subjectName: sub.name,
+          sourceKey: pk,
+          sourceName: pname,
+          paper: p,
+          num: null,
+          label: q.label,
+          or: q.or,
+          marks: q.marks,
+          co: null,
+          bl: null,
+          text: q.text,
+          table: !!q.table,
+        });
+      });
+    });
+  });
+  const byId = Object.fromEntries(allQuestions.map((q) => [q.id, q]));
+
+  /* ---------------- stats ---------------- */
+  const isDone = (id) => !!state.completed[id];
+  const isRev = (id) => !!state.revision[id];
+  function stats(list) {
+    const total = list.length;
+    let done = 0;
+    list.forEach((q) => { if (isDone(q.id)) done++; });
+    return { total, done, pending: total - done, pct: total ? Math.round((done / total) * 100) : 0 };
+  }
+  const totalStats = () => stats(allQuestions);
+  const subjectStats = (sid) => stats(allQuestions.filter((q) => q.subject === sid));
+
+  /* ---------------- helpers ---------------- */
+  const $ = (sel, root) => (root || document).querySelector(sel);
+  const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const esc = (s) =>
+    String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function questionCard(q) {
+    const done = isDone(q.id);
+    const rev = isRev(q.id);
+    const tags = [];
+    tags.push(`<span class="pill">${esc(q.sourceName)}</span>`);
+    if (q.or) tags.push(`<span class="pill or">OR</span>`);
+    if (q.marks) tags.push(`<span class="pill marks">${q.marks} marks</span>`);
+    if (q.co) tags.push(`<span class="pill marks">${esc(q.co)}</span>`);
+    if (q.bl) tags.push(`<span class="pill marks">BL ${esc(q.bl)}</span>`);
+    // image-transcribed tables are stored as "a | b | c" lines — render them in a mono block
+    const lines = q.text.split("\n");
+    const tableLines = lines.filter((l) => l.includes("|"));
+    const mainText = (tableLines.length ? lines.filter((l) => !l.includes("|")).join("\n") : q.text).trim();
+    return `
+      <article class="qcard ${done ? "completed" : ""}" data-qid="${esc(q.id)}">
+        <div class="qnum">${q.num ? esc(q.num) : esc(q.label.replace(/^Q\.?(\d).*/, "Q$1"))}</div>
+        <div class="qbody">
+          <div class="qtext">
+            ${mainText ? `<div class="qmain">${esc(mainText)}</div>` : ""}
+            ${tableLines.length ? `<div class="qtable">${esc(tableLines.join("\n"))}</div>` : ""}
+          </div>
+          <div class="qtags">${tags.join("")}</div>
+        </div>
+        <button class="icon-btn ${rev ? "on" : ""}" data-rev="${esc(q.id)}" title="${rev ? "Remove from revision" : "Practise again — add to revision"}" aria-pressed="${rev}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 1 2.5 6"/><path d="M3.5 21v-5h5"/></svg>
+        </button>
+        <label class="switch" title="Mark completed">
+          <input type="checkbox" data-toggle="${esc(q.id)}" ${done ? "checked" : ""} aria-label="Completed" />
+          <span class="track"></span><span class="thumb"></span>
+        </label>
+      </article>`;
+  }
+
+  function renderGrouped(list) {
+    if (!list.length) {
+      return `<div class="empty card"><div class="big">Nothing here yet</div>No questions match your filters.</div>`;
+    }
+    let html = "";
+    let lastKey = null;
+    list.forEach((q) => {
+      const key = q.subject + "|" + q.sourceKey;
+      if (key !== lastKey) {
+        const st = stats(list.filter((x) => x.subject === q.subject && x.sourceKey === q.sourceKey));
+        const title = q.sourceKey === "QB" ? `${q.subjectName} — Question Bank` : `${q.subjectName} — ${q.sourceName}`;
+        html += `<div class="qgroup"><h2>${esc(title)}</h2><span class="cnt">${st.done}/${st.total} done</span><span class="line"></span></div>`;
+        lastKey = key;
+      }
+      html += questionCard(q);
+    });
+    return `<div class="qlist">${html}</div>`;
+  }
+
+  /* ---------------- counters refresh ---------------- */
+  function refreshCounters() {
+    $$("[data-counter]").forEach((el) => {
+      const kind = el.dataset.counter;
+      let st;
+      if (kind === "total") st = totalStats();
+      else st = subjectStats(kind);
+      if (el.dataset.stat === "pct") el.textContent = st.pct + "%";
+      else if (el.dataset.stat === "done") el.textContent = st.done;
+      else if (el.dataset.stat === "pending") el.textContent = st.pending;
+      else el.textContent = st.total;
+    });
+    $$("[data-bar]").forEach((el) => {
+      const st = el.dataset.bar === "total" ? totalStats() : subjectStats(el.dataset.bar);
+      const fill = el.querySelector("span");
+      if (fill) {
+        fill.style.width = st.pct + "%";
+        fill.parentElement.classList.toggle("done", st.pct === 100);
+      }
+    });
+    $$(".ring-fill").forEach((el) => {
+      const st = totalStats();
+      const c = 2 * Math.PI * 54;
+      el.setAttribute("stroke-dashoffset", (c * (1 - st.pct / 100)).toFixed(1));
+    });
+    $$(".qcard").forEach((card) => {
+      card.classList.toggle("completed", isDone(card.dataset.qid));
+    });
+  }
+
+  /* ---------------- theme ---------------- */
+  function applyTheme() {
+    document.documentElement.dataset.theme = state.theme;
+  }
+  function toggleTheme() {
+    state.theme = state.theme === "dark" ? "light" : "dark";
+    save();
+    applyTheme();
+    toast(state.theme === "dark" ? "Dark theme on" : "Light theme on");
+  }
+
+  /* ---------------- toast & modal ---------------- */
+  let toastTimer;
+  function toast(msg) {
+    const el = $("#toast");
+    el.textContent = msg;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 2600);
+  }
+  function showModal(title, body, onConfirm) {
+    $("#modalTitle").textContent = title;
+    $("#modalBody").textContent = body;
+    const backdrop = $("#modalBackdrop");
+    backdrop.hidden = false;
+    const close = () => { backdrop.hidden = true; };
+    $("#modalCancel").onclick = close;
+    $("#modalConfirm").onclick = () => { close(); onConfirm(); };
+    backdrop.onclick = (e) => { if (e.target === backdrop) close(); };
+  }
+
+  /* ---------------- views ---------------- */
+  function head(eyebrow, title, sub) {
+    return `<header class="page-head"><div class="eyebrow">${esc(eyebrow)}</div><h1>${esc(title)}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ""}</header>`;
+  }
+
+  /* ---------------- dashboard extras ---------------- */
+  const DAY = 86400000;
+  const dayKey = (ts) => { const d = new Date(ts); return d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate(); };
+  const doneTs = (id) => (typeof state.completed[id] === "number" ? state.completed[id] : 0);
+  const doneEntries = () =>
+    allQuestions.map((q) => ({ q, ts: doneTs(q.id) })).filter((e) => e.ts).sort((a, b) => b.ts - a.ts);
+  function todayCount() { const t = dayKey(Date.now()); return doneEntries().filter((e) => dayKey(e.ts) === t).length; }
+  function weekCount() { const since = Date.now() - 7 * DAY; return doneEntries().filter((e) => e.ts >= since).length; }
+  function streak() {
+    const days = new Set(doneEntries().map((e) => dayKey(e.ts)));
+    let n = 0;
+    let d = days.has(dayKey(Date.now())) ? new Date() : new Date(Date.now() - DAY);
+    while (days.has(dayKey(d.getTime()))) { n++; d = new Date(d.getTime() - DAY); }
+    return n;
+  }
+  function timeAgo(ts) {
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
+  }
+  function questionOfDay() {
+    const pending = allQuestions.filter((q) => !isDone(q.id) && !q.text.includes("|"));
+    const pool = pending.length ? pending : allQuestions;
+    const seed = new Date().toDateString();
+    let h = 0;
+    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+    return pool[h % pool.length];
+  }
+
+  function viewDashboard() {
+    const t = totalStats();
+    const rows = subjects.map((s) => {
+      const st = subjectStats(s.id);
+      return `<div class="row">
+        <div class="top">
+          <span class="name">${esc(s.name)}<span>${esc(s.code)}</span></span>
+          <span class="nums"><b data-counter="${esc(s.id)}" data-stat="done">${st.done}</b>/${st.total} · <span data-counter="${esc(s.id)}" data-stat="pct">${st.pct}%</span></span>
+        </div>
+        <div class="bar" data-bar="${esc(s.id)}"><span style="width:${st.pct}%"></span></div>
+      </div>`;
+    }).join("");
+
+    const hour = new Date().getHours();
+    const greeting = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
+    const dateLabel = new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" });
+    const revCount = Object.keys(state.revision).length;
+    const GOAL = 30;
+    const wk = weekCount();
+    const wkPct = Math.min(100, Math.round((wk / GOAL) * 100));
+    const circ = (2 * Math.PI * 54).toFixed(1);
+    const off = (2 * Math.PI * 54 * (1 - t.pct / 100)).toFixed(1);
+
+    const qd = questionOfDay();
+    const qdDone = isDone(qd.id);
+    const qdLines = qd.text.split("\n").filter((l) => !l.includes("|"));
+
+    const acts = doneEntries().slice(0, 5);
+    const activity = acts.length
+      ? `<ul class="activity">${acts.map((a) => `
+        <li><a href="#/subject/${esc(a.q.subject)}">
+          <span class="dot"></span>
+          <span class="act-text">${esc(a.q.text.replace(/\n/g, " ").length > 62 ? a.q.text.replace(/\n/g, " ").slice(0, 62) + "…" : a.q.text.replace(/\n/g, " "))}</span>
+          <span class="act-time">${timeAgo(a.ts)}</span>
+        </a></li>`).join("")}</ul>`
+      : `<div class="act-empty">Flip your first switch in <a href="#/study">Study</a> and your progress will show up here.</div>`;
+
+    return `
+      <section class="hero">
+        <div class="hero-left">
+          <div class="hero-eyebrow">${greeting} · ${esc(dateLabel)}</div>
+          <h1>Semester 3 Exam Prep</h1>
+          <p class="hero-sub">${t.total} questions across 5 subjects — question banks and 10 official GTU papers, tracked automatically as you study.</p>
+          <div class="hero-chips">
+            <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5s5.5 4.7 5.5 10a5.5 5.5 0 0 1-11 0c0-2 .8-3.9 1.8-5.5.6 1.2 1.6 2 2.7 2.3C11.3 7.2 11.6 4.6 12 2.5Z"/></svg><b>${streak()}-day</b> streak</span>
+            <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4.5 12.5 5 5 10-11"/></svg><b>${todayCount()}</b> done today</span>
+            <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 1 2.5 6"/><path d="M3.5 21v-5h5"/></svg><b>${revCount}</b> in revision</span>
+          </div>
+          <div class="hero-actions">
+            <a class="btn btn-hero" href="#/study">Start studying</a>
+            <a class="btn btn-hero-ghost" href="#/subjects">Browse subjects</a>
+          </div>
+        </div>
+        <div class="hero-ring">
+          <svg viewBox="0 0 128 128" width="138" height="138" aria-hidden="true">
+            <circle class="ring-track" cx="64" cy="64" r="54"/>
+            <circle class="ring-fill" cx="64" cy="64" r="54" stroke-dasharray="${circ}" stroke-dashoffset="${off}" transform="rotate(-90 64 64)"/>
+          </svg>
+          <div class="ring-center">
+            <span class="ring-pct" data-counter="total" data-stat="pct">${t.pct}%</span>
+            <span class="ring-cap">complete</span>
+          </div>
+        </div>
+      </section>
+      <div class="stat-grid">
+        <div class="stat"><div class="k">Total questions</div><div class="v" data-counter="total">${t.total}</div></div>
+        <div class="stat"><div class="k">Completed</div><div class="v good" data-counter="total" data-stat="done">${t.done}</div></div>
+        <div class="stat"><div class="k">Pending</div><div class="v" data-counter="total" data-stat="pending">${t.pending}</div></div>
+        <div class="stat"><div class="k">This week</div><div class="v">${wk} <small>of ${GOAL} goal</small></div></div>
+      </div>
+      <div class="home-grid">
+        <div class="card subject-progress">
+          <div class="panel-head"><h2>Subject progress</h2><a class="mini-link" href="#/subjects">All subjects →</a></div>
+          ${rows}
+        </div>
+        <div class="home-side">
+          <article class="qcard qotd ${qdDone ? "completed" : ""}" data-qid="${esc(qd.id)}">
+            <div class="panel-head qotd-head"><h2>Question of the day</h2><span class="pill accent">Daily pick</span></div>
+            <div class="qtext"><div class="qmain">${esc(qdLines.join("\n"))}</div></div>
+            <div class="qtags">
+              <span class="pill">${esc(qd.subjectName)}</span>
+              <span class="pill">${esc(qd.sourceName)}</span>
+              ${qd.marks ? `<span class="pill marks">${qd.marks} marks</span>` : ""}
+            </div>
+            <div class="qotd-actions">
+              <button class="icon-btn ${isRev(qd.id) ? "on" : ""}" data-rev="${esc(qd.id)}" title="${isRev(qd.id) ? "Remove from revision" : "Practise again — add to revision"}" aria-pressed="${isRev(qd.id)}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 1 2.5 6"/><path d="M3.5 21v-5h5"/></svg>
+              </button>
+              <label class="switch" title="Mark completed">
+                <input type="checkbox" data-toggle="${esc(qd.id)}" ${qdDone ? "checked" : ""} aria-label="Completed" />
+                <span class="track"></span><span class="thumb"></span>
+              </label>
+            </div>
+          </article>
+          <div class="card activity-card">
+            <div class="panel-head"><h2>Recent activity</h2></div>
+            ${activity}
+          </div>
+          <div class="card week-card">
+            <div class="panel-head"><h2>Weekly goal</h2><span class="nums">${wk}/${GOAL} questions</span></div>
+            <div class="bar ${wkPct === 100 ? "done" : ""}"><span style="width:${wkPct}%"></span></div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function viewSubjects() {
+    const cards = subjects.map((s) => {
+      const st = subjectStats(s.id);
+      return `<a class="subject-card card" href="#/subject/${esc(s.id)}">
+        <div class="code"><span>${esc(s.code)}</span><span>${esc(s.id)}</span></div>
+        <h3>${esc(s.name)}</h3>
+        <div class="meta">${s.questionBank.length} question bank · ${s.papers.length} GTU papers · ${allQuestions.filter((q) => q.subject === s.id).length} questions</div>
+        <div class="bar" data-bar="${esc(s.id)}"><span style="width:${st.pct}%"></span></div>
+        <div class="foot">
+          <span class="pill ${st.pct === 100 ? "done" : "accent"}" data-counter="${esc(s.id)}" data-stat="pct">${st.pct}%</span>
+          <span><b data-counter="${esc(s.id)}" data-stat="done">${st.done}</b> of ${st.total} completed →</span>
+        </div>
+      </a>`;
+    }).join("");
+    return `
+      ${head("Library", "Subjects", "Five Diploma Computer Engineering subjects for Semester 3.")}
+      <div class="subject-grid">${cards}</div>`;
+  }
+
+  function viewSubject(sid) {
+    const sub = subjects.find((s) => s.id === sid);
+    if (!sub) return viewNotFound();
+    const st = subjectStats(sid);
+    const tab = subjectTab[sid] || "qb";
+    let listHtml = "";
+    if (tab === "qb") {
+      const list = allQuestions.filter((q) => q.subject === sid && q.sourceKey === "QB");
+      listHtml = renderGrouped(list);
+    } else {
+      let html = "";
+      sub.papers.forEach((p) => {
+        const list = allQuestions.filter((q) => q.subject === sid && q.paper === p);
+        const pst = stats(list);
+        html += `<div class="qgroup"><h2>${esc(p.season)} ${esc(p.year)} paper</h2>
+          <span class="cnt">${pst.done}/${pst.total} done · ${esc(p.meta.date || "")} · 70 marks</span><span class="line"></span></div>`;
+        html += `<div class="qlist">${list.map(questionCard).join("")}</div>`;
+      });
+      listHtml = html;
+    }
+    return `
+      ${head(`Subjects / ${sid}`, sub.name, `${sub.code} · ${st.done} of ${st.total} questions completed (${st.pct}%). Flip a switch to mark a question done — progress saves automatically.`)}
+      <div class="seg" role="tablist">
+        <button class="${tab === "qb" ? "active" : ""}" data-tab="qb">Question Bank · ${sub.questionBank.length}</button>
+        <button class="${tab === "papers" ? "active" : ""}" data-tab="papers">GTU Papers · ${sub.papers.length * sub.papers[0].questions.length}</button>
+      </div>
+      ${listHtml}`;
+  }
+
+  /* ---------------- study ---------------- */
+  const studyFilters = { q: "", subject: "all", source: "all", status: "all" };
+
+  function studyList() {
+    const q = studyFilters.q.trim().toLowerCase();
+    let list = allQuestions.filter((x) => {
+      if (studyFilters.subject !== "all" && x.subject !== studyFilters.subject) return false;
+      if (studyFilters.source !== "all") {
+        if (studyFilters.source === "QB" && x.sourceKey !== "QB") return false;
+        if (studyFilters.source !== "QB" && x.sourceKey !== studyFilters.source) return false;
+      }
+      if (studyFilters.status === "pending" && isDone(x.id)) return false;
+      if (studyFilters.status === "completed" && !isDone(x.id)) return false;
+      if (studyFilters.status === "revision" && !isRev(x.id)) return false;
+      if (q && !(x.text.toLowerCase().includes(q) || x.subjectName.toLowerCase().includes(q) || x.sourceName.toLowerCase().includes(q))) return false;
+      return true;
+    });
+    return renderGrouped(list);
+  }
+
+  function paperOptions() {
+    const opts = new Set();
+    allQuestions.forEach((x) => { if (x.sourceKey !== "QB") opts.add(x.sourceKey + "|" + x.sourceName); });
+    return Array.from(opts).sort();
+  }
+
+  function viewStudy() {
+    const subjectOpts = subjects.map((s) => `<option value="${esc(s.id)}" ${studyFilters.subject === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
+    const sourceOpts = paperOptions().map((o) => {
+      const [k, n] = o.split("|");
+      return `<option value="${esc(k)}" ${studyFilters.source === k ? "selected" : ""}>${esc(n)}</option>`;
+    }).join("");
+    return `
+      ${head("Practice", "Study", "Search and filter every question. Mark the ones you want to practise again with the repeat button.")}
+      <div class="card filters">
+        <div class="search-wrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.4-3.4"/></svg>
+          <input class="input" id="studySearch" type="search" placeholder="Search all questions…" value="${esc(studyFilters.q)}" />
+        </div>
+        <div class="row3">
+          <select class="select" id="fSubject">
+            <option value="all">All subjects</option>${subjectOpts}
+          </select>
+          <select class="select" id="fSource">
+            <option value="all">All sources</option>
+            <option value="QB" ${studyFilters.source === "QB" ? "selected" : ""}>Question banks</option>
+            ${sourceOpts}
+          </select>
+          <select class="select" id="fStatus">
+            <option value="all">All questions</option>
+            <option value="pending" ${studyFilters.status === "pending" ? "selected" : ""}>Pending only</option>
+            <option value="completed" ${studyFilters.status === "completed" ? "selected" : ""}>Completed only</option>
+            <option value="revision" ${studyFilters.status === "revision" ? "selected" : ""}>Marked for revision</option>
+          </select>
+        </div>
+      </div>
+      <div id="studyList">${studyList()}</div>`;
+  }
+
+  function bindStudy() {
+    const search = $("#studySearch");
+    let deb;
+    search.addEventListener("input", () => {
+      clearTimeout(deb);
+      deb = setTimeout(() => {
+        studyFilters.q = search.value;
+        $("#studyList").innerHTML = studyList();
+      }, 160);
+    });
+    $("#fSubject").addEventListener("change", (e) => {
+      studyFilters.subject = e.target.value;
+      $("#studyList").innerHTML = studyList();
+    });
+    $("#fSource").addEventListener("change", (e) => {
+      studyFilters.source = e.target.value;
+      $("#studyList").innerHTML = studyList();
+    });
+    $("#fStatus").addEventListener("change", (e) => {
+      studyFilters.status = e.target.value;
+      $("#studyList").innerHTML = studyList();
+    });
+  }
+
+  /* ---------------- revision ---------------- */
+  function viewRevision() {
+    const list = allQuestions.filter((q) => isRev(q.id));
+    const body = list.length
+      ? `<div class="qlist">${list.map(questionCard).join("")}</div>`
+      : `<div class="empty card"><div class="big">No questions marked yet</div>Open any question list and tap the repeat button to practise it again later.</div>`;
+    return `
+      ${head("Practise again", "Revision", `${list.length} question${list.length === 1 ? "" : "s"} marked to practise again.`)}
+      ${body}`;
+  }
+
+  /* ---------------- settings ---------------- */
+  function viewSettings() {
+    const t = totalStats();
+    return `
+      ${head("Preferences", "Settings", "Your progress is stored on this device in your browser — no account, no backend.")}
+      <div class="settings-grid">
+        <div class="card setting-row">
+          <div class="info"><h3>Appearance</h3><p>Switch between the light and dark themes.</p></div>
+          <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
+            <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5 5l1.4 1.4M17.6 17.6 19 19M19 5l-1.4 1.4M6.4 17.6 5 19"/></svg>
+            <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z"/></svg>
+            <span class="knob"></span>
+          </button>
+        </div>
+        <div class="card setting-row">
+          <div class="info"><h3>Export progress</h3><p>Download a JSON backup of your completed and revision questions.</p></div>
+          <button class="btn btn-ghost" id="exportBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11M7.5 10 12 14.5 16.5 10M4.5 20h15"/></svg>
+            Export
+          </button>
+        </div>
+        <div class="card setting-row">
+          <div class="info"><h3>Import progress</h3><p>Restore progress from a previously exported JSON file.</p></div>
+          <button class="btn btn-ghost" id="importBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14.5v-11M7.5 8 12 3.5 16.5 8M4.5 20h15"/></svg>
+            Import
+          </button>
+          <input type="file" id="importFile" accept="application/json,.json" hidden />
+        </div>
+        <div class="card setting-row">
+          <div class="info"><h3>Reset progress</h3><p>Clear every toggle and revision mark. This cannot be undone.</p></div>
+          <button class="btn btn-danger" id="resetBtn">Reset</button>
+        </div>
+        <div class="card setting-row">
+          <div class="info"><h3>Data summary</h3><p>${t.total} questions across 5 subjects · ${t.done} completed · ${t.pending} pending · saved locally in this browser.</p></div>
+        </div>
+      </div>`;
+  }
+
+  function bindSettings() {
+    $("#themeToggle").addEventListener("click", toggleTheme);
+    $("#exportBtn").addEventListener("click", () => {
+      const payload = JSON.stringify({ app: "GTU PREP", version: 1, exportedAt: new Date().toISOString(), completed: state.completed, revision: state.revision }, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "gtu-prep-progress.json";
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast("Progress exported");
+    });
+    $("#importBtn").addEventListener("click", () => $("#importFile").click());
+    $("#importFile").addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const data = JSON.parse(reader.result);
+          if (typeof data.completed !== "object" || typeof data.revision !== "object") throw new Error("bad");
+          showModal("Import progress?", "This will replace your current progress with the imported file.", () => {
+            state.completed = data.completed || {};
+            state.revision = data.revision || {};
+            save();
+            refreshCounters();
+            toast("Progress imported");
+            render();
+          });
+        } catch {
+          toast("That file isn't a valid GTU PREP export");
+        }
+      };
+      reader.readAsText(file);
+      e.target.value = "";
+    });
+    $("#resetBtn").addEventListener("click", () => {
+      showModal("Reset all progress?", "Every completed toggle and revision mark will be cleared. This cannot be undone.", () => {
+        state.completed = {};
+        state.revision = {};
+        save();
+        refreshCounters();
+        toast("Progress reset");
+        render();
+      });
+    });
+  }
+
+  function viewNotFound() {
+    return `<div class="empty card" style="margin-top:40px"><div class="big">Page not found</div>Use the navigation below to get back on track.</div>`;
+  }
+
+  /* ---------------- router ---------------- */
+  const subjectTab = {};
+  let currentRoute = { name: "dashboard" };
+
+  function parseHash() {
+    const h = location.hash.replace(/^#\/?/, "");
+    const parts = h.split("/").filter(Boolean);
+    if (!parts.length) return { name: "dashboard" };
+    if (parts[0] === "subject" && parts[1]) return { name: "subject", id: parts[1] };
+    if (["dashboard", "subjects", "study", "revision", "settings"].includes(parts[0])) return { name: parts[0] };
+    return { name: "notfound" };
+  }
+
+  function render() {
+    const view = $("#view");
+    const r = currentRoute;
+    // restart the enter animation
+    view.classList.remove("view");
+    void view.offsetWidth;
+    view.classList.add("view");
+
+    if (r.name === "dashboard") view.innerHTML = viewDashboard();
+    else if (r.name === "subjects") view.innerHTML = viewSubjects();
+    else if (r.name === "subject") view.innerHTML = viewSubject(r.id);
+    else if (r.name === "study") { view.innerHTML = viewStudy(); bindStudy(); }
+    else if (r.name === "revision") view.innerHTML = viewRevision();
+    else if (r.name === "settings") { view.innerHTML = viewSettings(); bindSettings(); }
+    else view.innerHTML = viewNotFound();
+
+    positionDock();
+    window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
+  }
+
+  /* ---------------- dock ---------------- */
+  function positionDock() {
+    const active = $(".dock-item[data-route='" + currentRoute.name + "']");
+    const indicator = $("#dockIndicator");
+    $$(".dock-item").forEach((el) => el.classList.remove("active"));
+    if (!active || !indicator) return;
+    active.classList.add("active");
+    indicator.style.left = active.offsetLeft + "px";
+    indicator.style.width = active.offsetWidth + "px";
+  }
+
+  /* ---------------- global events ---------------- */
+  document.addEventListener("change", (e) => {
+    const input = e.target.closest("[data-toggle]");
+    if (!input) return;
+    const qid = input.dataset.toggle;
+    if (input.checked) state.completed[qid] = Date.now();
+    else delete state.completed[qid];
+    save();
+    const card = input.closest(".qcard");
+    if (card) card.classList.toggle("completed", input.checked);
+    refreshCounters();
+  });
+
+  document.addEventListener("click", (e) => {
+    const revBtn = e.target.closest("[data-rev]");
+    if (revBtn) {
+      const qid = revBtn.dataset.rev;
+      if (state.revision[qid]) {
+        delete state.revision[qid];
+        toast("Removed from revision");
+      } else {
+        state.revision[qid] = true;
+        toast("Marked to practise again");
+      }
+      save();
+      if (currentRoute.name === "revision") render();
+      else {
+        revBtn.classList.toggle("on", isRev(qid));
+        revBtn.setAttribute("aria-pressed", isRev(qid));
+      }
+      return;
+    }
+    const tab = e.target.closest("[data-tab]");
+    if (tab) {
+      const id = currentRoute.id;
+      subjectTab[id] = tab.dataset.tab;
+      render();
+    }
+  });
+
+  window.addEventListener("hashchange", () => {
+    currentRoute = parseHash();
+    render();
+  });
+  window.addEventListener("resize", positionDock);
+
+  /* ---------------- boot ---------------- */
+  applyTheme();
+  currentRoute = parseHash();
+  render();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(positionDock);
+  window.addEventListener("load", positionDock);
 })();
